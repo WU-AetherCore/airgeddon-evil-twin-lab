@@ -46,7 +46,7 @@ sudo airodump-ng wlxYOUR_IFACE
 ```
  BSSID              CH  ENC   CIPHER  AUTH  ESSID
  C8:75:F4:40:D6:8A   6  WPA2  CCMP    PSK   CMCC-gf7e
- FA:07:B2:AC:30:45   6  WPA2  CCMP    PSK   WU_5G
+ AA:BB:CC:DD:EE:01   6  WPA2  CCMP    PSK   WU_5G
 ```
 
 ## 2.3 记录目标信息
