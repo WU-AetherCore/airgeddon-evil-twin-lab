@@ -1,0 +1,11 @@
+# hostapd-mana 假 AP 配置模板（攻击时由 evil_control.py 动态生成，此文件供参考）
+# 关键: mana_wpaout 开放模式 —— 客户端连上后无需密码，流量被导向钓鱼页
+interface=wlxYOUR_USB_WIFI_IFACE
+driver=nl80211
+ssid=YOUR_TARGET_SSID
+hw_mode=g
+channel=6
+mana_wpaout=/opt/evil-twin/mana.hccapx
+# 说明:
+#   - 该二进制为 hostapd-mana (sycophant 变体)，仅支持 mana_wpaout
+#   - 开放模式: 不设置 wpa=2/密码，客户端直接连入，再由 dnsmasq 劫持 DNS

