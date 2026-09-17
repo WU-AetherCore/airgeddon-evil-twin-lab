@@ -1,0 +1,18 @@
+# 忽略敏感/临时文件
+config.env
+passwords.txt
+*.hccapx
+*.22000
+*.cap
+*.pcap
+.verify_tmp.txt
+mana.hccapx
+hashcat-*
+kernels/
+*.jpg
+*.png
+*.jpeg
+user_issue*
+phone_wifi*
+__pycache__/
+*.pyc

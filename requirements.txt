@@ -1,0 +1,6 @@
+# Python 依赖（仅控制台/钓鱼页运行时需要，其余为系统级工具）
+# 系统级工具由 deploy/install-airgeddon.sh 自动安装
+
+# 无需额外 Python 依赖（核心程序只用标准库）
+# 如需 pip 安装开发辅助工具:
+# pip install requests
