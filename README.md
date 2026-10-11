@@ -42,7 +42,7 @@
 ```
 airgeddon-evil-twin-lab/
 ├── README.md                  # 本文件
-├── LICENSE                    # MIT 许可证
+├── LICENSE                    # PolyForm Noncommercial 1.0.0
 ├── docs/                      # 8 篇详细中文教程
 │   ├── 01-环境准备与依赖安装.md
 │   ├── 02-侦察-扫描目标WiFi.md
@@ -108,4 +108,4 @@ sudo bash scripts/restart_control.sh
 
 ## 📄 许可证
 
-[MIT](LICENSE)。Airgeddon 本身为 GPL 协议，使用其代码/脚本时请遵循上游许可。
+本仓库原创脚本和文档按 [PolyForm Noncommercial 1.0.0](LICENSE) 许可：允许个人学习、实验、修改和非商业分享；商业用途须事先取得 WU-AetherCore 的书面许可。Airgeddon 本身为 GPL 协议，其代码和组件继续遵循上游许可。此前按 MIT 发布的历史版本及已授予权利不会被本次变更追溯撤销。
